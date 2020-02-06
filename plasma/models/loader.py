@@ -81,7 +81,7 @@ class Loader(object):
                 # Each chunk will be a multiple of the batch size
                 for j, (X, y) in enumerate(zip(X_list, y_list)):
                     num_examples = X.shape[0]
-                    assert(num_examples % batch_size == 0)
+                    assert num_examples % batch_size == 0
                     num_chunks = num_examples//batch_size
                     """
                     The method produces batch-sized training data X and labels
@@ -107,13 +107,8 @@ class Loader(object):
                         num_so_far, num_total
             epoch += 1
 
-    def fill_training_buffer(
-            self,
-            Xbuff,
-            Ybuff,
-            end_indices,
-            shot,
-            is_first_fill=False):
+    def fill_training_buffer(self, Xbuff, Ybuff, end_indices, shot,
+                             is_first_fill=False):
         sig, res = self.get_signal_result_from_shot(shot)
         length = self.conf['model']['length']
         if is_first_fill:  # cut signal to random position
@@ -123,7 +118,7 @@ class Loader(object):
 
         sig_len = res.shape[0]
         sig_len = (sig_len // length)*length  # make divisible by lenth
-        assert(sig_len > 0)
+        assert sig_len > 0
         batch_idx = np.where(end_indices == 0)[0][0]
         if sig_len > Xbuff.shape[1]:
             Xbuff = self.resize_buffer(Xbuff, sig_len+length)
@@ -137,7 +132,7 @@ class Loader(object):
     def return_from_training_buffer(self, Xbuff, Ybuff, end_indices):
         length = self.conf['model']['length']
         end_indices -= length
-        assert(np.all(end_indices >= 0))
+        assert np.all(end_indices >= 0)
         X = 1.0*Xbuff[:, :length, :]
         Y = 1.0*Ybuff[:, :length, :]
         self.shift_buffer(Xbuff, length)
@@ -147,18 +142,167 @@ class Loader(object):
     def shift_buffer(self, buff, length):
         buff[:, :-length, :] = buff[:, length:, :]
 
-    def resize_buffer(self, buff, new_length):
+    def resize_buffer(self, buff, new_length, dtype=None):
+        if dtype is None:
+            dtype = self.conf['data']['floatx']
         old_length = buff.shape[1]
         batch_size = buff.shape[0]
         num_signals = buff.shape[2]
-        new_buff = np.empty(
-            (batch_size,
-             new_length,
-             num_signals),
-            dtype=self.conf['data']['floatx'])
+        new_buff = np.zeros((batch_size, new_length, num_signals), dtype=dtype)
         new_buff[:, :old_length, :] = buff
         # print("Resizing buffer to new length {}".format(new_length))
         return new_buff
+
+    def inference_batch_generator_full_shot(self, shot_list):
+        """
+        The method implements a training batch generator as a Python generator
+        with a while-loop.
+
+        It iterates indefinitely over the data set and returns one mini-batch
+        of data at a time.
+
+
+        NOTE: Can be inefficient during distributed training because one
+        process loading data will cause all other processes to stall.
+
+        Argument list:
+          - shot_list:
+
+        Returns:
+          - One mini-batch of data and label as a Numpy array:
+                 X[start:end],y[start:end]
+          - reset_states_now: boolean flag indicating when to reset state
+            during stateful RNN training
+          - num_so_far,num_total: number of samples generated so far and
+            the total dataset size as per shot_list
+        """
+        batch_size = self.conf['model']['pred_batch_size']
+        sig, res = self.get_signal_result_from_shot(shot_list.shots[0])
+        Xbuff = np.zeros((batch_size,) + sig.shape,
+                         dtype=self.conf['data']['floatx'])
+        Ybuff = np.zeros((batch_size,) + res.shape,
+                         dtype=self.conf['data']['floatx'])
+        Maskbuff = np.zeros((batch_size,) + res.shape,
+                            dtype=self.conf['data']['floatx'])
+        disr = np.zeros(batch_size, dtype=bool)
+        lengths = np.zeros(batch_size, dtype=int)
+        # epoch = 0
+        num_total = len(shot_list)
+        num_so_far = 0
+        #  returned = False
+        #  num_steps = 0
+        batch_idx = 0
+        np.seterr(all='raise')
+        # warmup_steps = self.conf['training']['batch_generator_warmup_steps']
+        # is_warmup_period = num_steps < warmup_steps
+        # is_first_fill = num_steps < batch_size
+        while True:
+            # the list of all shots
+            # shot_list.shuffle()
+            for i in range(num_total):
+                shot = shot_list.shots[i]
+                sig, res = self.get_signal_result_from_shot(shot)
+                sig_len = res.shape[0]
+                if sig_len > Xbuff.shape[1]:  # resize buffer if needed
+                    old_len = Xbuff.shape[1]
+                    Xbuff = self.resize_buffer(Xbuff, sig_len)
+                    Ybuff = self.resize_buffer(Ybuff, sig_len)
+                    Maskbuff = self.resize_buffer(Maskbuff, sig_len)
+                    Maskbuff[:, old_len:, :] = 0.0
+
+                Xbuff[batch_idx, :, :] = 0.0
+                Ybuff[batch_idx, :, :] = 0.0
+                Maskbuff[batch_idx, :, :] = 0.0
+                Xbuff[batch_idx, :sig_len, :] = sig
+                Ybuff[batch_idx, :sig_len, :] = res
+                Maskbuff[batch_idx, :sig_len, :] = 1.0
+                disr[batch_idx] = shot.is_disruptive_shot()
+                lengths[batch_idx] = res.shape[0]
+                batch_idx += 1
+                if batch_idx == batch_size:
+                    num_so_far += batch_size
+                    x1 = 1.0*Xbuff
+                    x2 = 1.0*Ybuff
+                    x3 = 1.0*Maskbuff
+                    x4 = disr & True
+                    x5 = 1*lengths
+
+                    yield x1, x2, x3, x4, x5, num_so_far, num_total
+                    batch_idx = 0
+
+    def training_batch_generator_full_shot_partial_reset(self, shot_list):
+        """
+
+        The method implements a training batch generator as a Python generator
+        with a while-loop. It iterates indefinitely over the data set and
+        returns one mini-batch of data at a time.
+
+        NOTE: Can be inefficient during distributed training because one
+        process loading data will cause all other processes to stall.
+
+        Argument list:
+          - shot_list:
+
+        Returns:
+          - One mini-batch of data and label as a Numpy array:
+            X[start:end],y[start:end]
+          - reset_states_now: boolean flag indicating when to reset state
+            during stateful RNN training
+          - num_so_far,num_total: number of samples generated so far and the
+            total dataset size as per shot_list
+        """
+        batch_size = self.conf['training']['batch_size']
+        sig, res = self.get_signal_result_from_shot(shot_list.shots[0])
+        Xbuff = np.empty((batch_size,) + sig.shape,
+                         dtype=self.conf['data']['floatx'])
+        Ybuff = np.empty((batch_size,) + res.shape,
+                         dtype=self.conf['data']['floatx'])
+        Maskbuff = np.empty((batch_size,) + res.shape,
+                            dtype=self.conf['data']['floatx'])
+        # epoch = 0
+        num_total = len(shot_list)
+        num_so_far = 0
+        batch_idx = 0
+        # warmup_steps = self.conf['training']['batch_generator_warmup_steps']
+        # is_warmup_period = num_steps < warmup_steps
+        # is_first_fill = num_steps < batch_size
+        while True:
+            # the list of all shots
+            shot_list.shuffle()
+            for i in range(num_total):
+                shot = self.sample_shot_from_list_given_index(shot_list, i)
+                sig, res = self.get_signal_result_from_shot(shot)
+                sig_len = res.shape[0]
+                if sig_len > Xbuff.shape[1]:  # resize buffer if needed
+                    old_len = Xbuff.shape[1]
+                    Xbuff = self.resize_buffer(Xbuff, sig_len)
+                    Ybuff = self.resize_buffer(Ybuff, sig_len)
+                    Maskbuff = self.resize_buffer(Maskbuff, sig_len)
+                    Maskbuff[:, old_len:, :] = 0.0
+
+                Xbuff[batch_idx, :, :] = 0.0
+                Ybuff[batch_idx, :, :] = 0.0
+                Maskbuff[batch_idx, :, :] = 0.0
+
+                Xbuff[batch_idx, :sig_len, :] = sig
+                Ybuff[batch_idx, :sig_len, :] = res
+                Maskbuff[batch_idx, :sig_len, :] = 1.0
+                batch_idx += 1
+                if batch_idx == batch_size:
+                    num_so_far += batch_size
+                    yield (1.0*Xbuff, 1.0*Ybuff, 1.0*Maskbuff, num_so_far,
+                           num_total)
+                    batch_idx = 0
+
+    def sample_shot_from_list_given_index(self, shot_list, i):
+        if self.conf['training']['ranking_difficulty_fac'] == 1.0:
+            if self.conf['data']['equalize_classes']:
+                shot = shot_list.sample_equal_classes()
+            else:
+                shot = shot_list.shots[i]
+        else:  # draw the shot weighted
+            shot = shot_list.sample_weighted()
+        return shot
 
     def training_batch_generator_partial_reset(self, shot_list):
         """
@@ -205,7 +349,11 @@ class Loader(object):
                     if self.conf['data']['equalize_classes']:
                         shot = shot_list.sample_equal_classes()
                     else:
-                        shot = shot_list.shots[i]
+                        # TODO(KGF): test my merge of the "jdev" branch for the
+                        # following line into this set of conditionals
+                        shot = self.sample_shot_from_list_given_index(
+                            shot_list, i)
+                        # shot = shot_list.shots[i]
                 else:  # draw the shot weighted
                     shot = shot_list.sample_weighted()
                 while not np.any(end_indices == 0):
@@ -235,20 +383,15 @@ class Loader(object):
 
     def training_batch_generator_process(self, shot_list):
         queue = mp.Queue()
-        proc = mp.Process(
-            target=self.fill_batch_queue, args=(
-                shot_list, queue))
+        proc = mp.Process(target=self.fill_batch_queue,
+                          args=(shot_list, queue))
         proc.start()
         while True:
             yield queue.get(True)
         proc.join()
         queue.close()
 
-    def load_as_X_y_list(
-            self,
-            shot_list,
-            verbose=False,
-            prediction_mode=False):
+    def load_as_X_y_list(self, shot_list, prediction_mode=False):
         """
         The method turns a ShotList into a set of equal-sized patches which
         contain a number of examples that is a multiple of the batch size.
@@ -264,7 +407,6 @@ class Loader(object):
 
         Argument list:
           - shot_list: a ShotList
-          - verbose: TO BE DEPRECATED, self.verbose data member is used instead
           - prediction_mode: unused
 
         Returns:
@@ -288,8 +430,7 @@ class Loader(object):
                 len(res_patches[0]), len(res_patches)))
         return X_list, y_list
 
-    def load_as_X_y_pred(self, shot_list, verbose=False,
-                         custom_batch_size=None):
+    def load_as_X_y_pred(self, shot_list, custom_batch_size=None):
         (signals, results, shot_lengths,
          disruptive) = self.get_signals_results_from_shotlist(
              shot_list, prediction_mode=True)
@@ -310,8 +451,8 @@ class Loader(object):
         shot_lengths = []
         total_length = 0
         for shot in shot_list:
-            assert(isinstance(shot, Shot))
-            assert(shot.valid)
+            assert isinstance(shot, Shot)
+            assert shot.valid
             shot.restore(prepath)
 
             if self.normalizer is not None:
@@ -346,8 +487,8 @@ class Loader(object):
     def get_signal_result_from_shot(self, shot, prediction_mode=False):
         prepath = self.conf['paths']['processed_prepath']
         use_signals = self.conf['paths']['use_signals']
-        assert(isinstance(shot, Shot))
-        assert(shot.valid)
+        assert isinstance(shot, Shot)
+        assert shot.valid
         shot.restore(prepath)
         if self.normalizer is not None:
             self.normalizer.apply(shot)
@@ -377,7 +518,7 @@ class Loader(object):
     def batch_output_to_array(self, output, batch_size=None):
         if batch_size is None:
             batch_size = self.conf['model']['pred_batch_size']
-        assert(output.shape[0] % batch_size == 0)
+        assert output.shape[0] % batch_size == 0
         num_chunks = output.shape[0] // batch_size
         num_timesteps = output.shape[1]
         feature_size = output.shape[2]
@@ -409,7 +550,7 @@ class Loader(object):
         res_patches = []
         if len(sig) <= min_len:
             print('signal length: {}'.format(len(sig)))
-        assert(min_len <= len(sig))
+        assert min_len <= len(sig)
         for start in range(0, len(sig)-min_len, min_len):
             sig_patches.append(sig[start:start+min_len])
             res_patches.append(res[start:start+min_len])
@@ -492,13 +633,12 @@ class Loader(object):
         total_num = int(np.ceil(1.0 * num_already / total_num)) * total_num
 
         num_additional = total_num - num_already
-        assert(num_additional >= 0)
+        assert num_additional >= 0
         sig_patches_rand, res_patches_rand = self.make_random_patches(
             signals, results, num_additional)
         if self.verbose:
-            print(
-                'random to deterministic ratio: {}/{}'.format(num_additional,
-                                                              num_already))
+            print('random to deterministic ratio: {}/{}'.format(num_additional,
+                                                                num_already))
         return (sig_patches_det + sig_patches_rand,
                 res_patches_det + res_patches_rand)
 
@@ -524,9 +664,9 @@ class Loader(object):
     def arange_patches(self, sig_patches, res_patches):
         num_timesteps = self.conf['model']['length']
         batch_size = self.conf['training']['batch_size']
-        assert(len(sig_patches) % batch_size == 0)  # fixed number of batches
+        assert len(sig_patches) % batch_size == 0  # fixed number of batches
         # divisible by length of RNN sequence
-        assert(len(sig_patches[0]) % num_timesteps == 0)
+        assert len(sig_patches[0]) % num_timesteps == 0
         num_batches = len(sig_patches) // batch_size
         # patch_length = len(sig_patches[0])
 
@@ -543,12 +683,8 @@ class Loader(object):
             y_list.append(y)
         return X_list, y_list
 
-    def arange_patches_single(
-            self,
-            sig_patches,
-            res_patches,
-            prediction_mode=False,
-            custom_batch_size=None):
+    def arange_patches_single(self, sig_patches, res_patches,
+                              prediction_mode=False, custom_batch_size=None):
         if prediction_mode:
             num_timesteps = self.conf['model']['pred_length']
             batch_size = self.conf['model']['pred_batch_size']
@@ -559,8 +695,8 @@ class Loader(object):
         if custom_batch_size is not None:
             batch_size = custom_batch_size
 
-        assert(len(sig_patches) == batch_size)
-        assert(len(sig_patches[0]) % num_timesteps == 0)
+        assert len(sig_patches) == batch_size
+        assert len(sig_patches[0]) % num_timesteps == 0
         num_chunks = len(sig_patches[0]) // num_timesteps
         num_dimensions_of_data = sig_patches[0].shape[1]
         if len(res_patches[0].shape) == 1:
@@ -568,10 +704,8 @@ class Loader(object):
         else:
             num_answers = res_patches[0].shape[1]
 
-        X = np.zeros(
-            (num_chunks*batch_size,
-             num_timesteps,
-             num_dimensions_of_data))
+        X = np.zeros((num_chunks*batch_size, num_timesteps,
+                      num_dimensions_of_data))
         if return_sequences:
             y = np.zeros((num_chunks*batch_size, num_timesteps, num_answers))
         else:
@@ -591,9 +725,9 @@ class Loader(object):
                         :] = res_patches[patch_idx][src_end-1]
         return X, y
 
-    def load_as_X_y(self, shot, verbose=False, prediction_mode=False):
-        assert(isinstance(shot, Shot))
-        assert(shot.valid)
+    def load_as_X_y(self, shot, prediction_mode=False):
+        assert isinstance(shot, Shot)
+        assert shot.valid
         prepath = self.conf['paths']['processed_prepath']
         return_sequences = self.conf['model']['return_sequences']
         shot.restore(prepath)
@@ -640,11 +774,7 @@ class Loader(object):
         return signals, ttd
 
     def array_to_path_and_external_pred_cut(
-            self,
-            arr,
-            res,
-            return_sequences=False,
-            prediction_mode=False):
+            self, arr, res, return_sequences=False, prediction_mode=False):
         num_timesteps = self.conf['model']['length']
         skip = self.conf['model']['skip']
         if prediction_mode:
@@ -652,11 +782,11 @@ class Loader(object):
             if not return_sequences:
                 num_timesteps = 1
             skip = num_timesteps  # batchsize = 1!
-        assert(np.shape(arr)[0] == np.shape(res)[0])
+        assert np.shape(arr)[0] == np.shape(res)[0]
         num_chunks = len(arr) // num_timesteps
         arr = arr[-num_chunks*num_timesteps:]
         res = res[-num_chunks*num_timesteps:]
-        assert(np.shape(arr)[0] == np.shape(res)[0])
+        assert np.shape(arr)[0] == np.shape(res)[0]
         X = []
         y = []
         i = 0
@@ -670,7 +800,7 @@ class Loader(object):
         for chunk in chunk_range:
             for i in i_range:
                 start = chunk*num_timesteps + i
-                assert(start + num_timesteps <= len(arr))
+                assert start + num_timesteps <= len(arr)
                 X.append(arr[start:start+num_timesteps, :])
                 if return_sequences:
                     y.append(res[start:start+num_timesteps])
@@ -705,8 +835,10 @@ class ProcessGenerator(object):
 
     def fill_batch_queue(self):
         print("Starting process to fetch data")
+        count = 0
         while True:
             self.queue.put(next(self.generator), True)
+            count += 1
 
     def __next__(self):
         return self.queue.get(True)

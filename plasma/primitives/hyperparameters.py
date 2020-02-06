@@ -33,7 +33,6 @@ class Hyperparam(object):
 
 
 class CategoricalHyperparam(Hyperparam):
-
     def __init__(self, path, values):
         self.path = path
         self.values = values
@@ -43,7 +42,6 @@ class CategoricalHyperparam(Hyperparam):
 
 
 class GridCategoricalHyperparam(Hyperparam):
-
     def __init__(self, path, values):
         self.path = path
         self.values = iter(values)
@@ -105,7 +103,7 @@ class HyperparamExperiment(object):
         self.raw_logs_path = path[:-1] + ".out"
         self.changed_path = os.path.join(path, "changed_params.out")
         with open(os.path.join(self.path, conf_name), 'r') as yaml_file:
-            conf = yaml.load(yaml_file)
+            conf = yaml.load(yaml_file, Loader=yaml.SafeLoader)
         self.name_to_monitor = conf['callbacks']['monitor']
         self.load_data()
         self.get_changed()
@@ -138,7 +136,7 @@ class HyperparamExperiment(object):
         import pandas
         if os.path.exists(self.logs_path):
             files = os.listdir(self.logs_path)
-            assert(len(files) == 1)
+            assert len(files) == 1
             self.logs_path = self.logs_path + files[0]
             if os.path.getsize(self.logs_path) > 0:
                 dat = pandas.read_csv(self.logs_path)

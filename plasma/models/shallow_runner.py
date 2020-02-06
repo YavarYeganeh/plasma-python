@@ -3,13 +3,14 @@ from keras.utils.generic_utils import Progbar
 import keras.callbacks as cbks
 from sklearn.metrics import classification_report
 #  accuracy_score, auc, confusion_matrix
-from sklearn.externals import joblib
+import joblib
 from sklearn.ensemble import RandomForestClassifier
 import hashlib
 from plasma.utils.downloading import makedirs_process_safe
 # from plasma.utils.state_reset import reset_states
-from plasma.utils.evaluation import ttd, get_loss_from_list
+from plasma.utils.evaluation import get_loss_from_list
 from plasma.utils.performance import PerformanceAnalyzer
+from plasma.utils.diagnostics import print_shot_list_sizes
 # from plasma.models.loader import Loader, ProcessGenerator
 # from plasma.conf import conf
 from sklearn.neural_network import MLPClassifier
@@ -20,9 +21,12 @@ import os
 import datetime
 import time
 import numpy as np
-# import matplotlib.pyplot as plt
+
+from copy import deepcopy
+
 import matplotlib
 matplotlib.use('Agg')
+# import matplotlib.pyplot as plt
 
 # import sys
 # if sys.version_info[0] < 3:
@@ -31,7 +35,6 @@ matplotlib.use('Agg')
 # leading to import errors:
 # from hyperopt import hp, STATUS_OK
 # from hyperas.distributions import conditional
-
 
 debug_use_shots = 100000
 model_filename = "saved_model.pkl"
@@ -70,12 +73,8 @@ class FeatureExtractor(object):
             return val, val
         return sample_prob_d, sample_prob_nd
 
-    def load_shots(
-            self,
-            shot_list,
-            is_inference=False,
-            as_list=False,
-            num_samples=np.Inf):
+    def load_shots(self, shot_list, is_inference=False, as_list=False,
+                   num_samples=np.Inf):
         X = []
         Y = []
         Disr = []
@@ -119,7 +118,7 @@ class FeatureExtractor(object):
         if not os.path.exists(save_prepath):
             makedirs_process_safe(save_prepath)
         prepath = self.loader.conf['paths']['processed_prepath']
-        assert(shot.valid)
+        assert shot.valid
         shot.restore(prepath)
         self.loader.set_inference_mode(True)  # make sure shots aren't cut
         if self.loader.normalizer is not None:
@@ -137,7 +136,7 @@ class FeatureExtractor(object):
             # print(X.shape, Y.shape)
         else:
             try:
-                dat = np.load(save_path)
+                dat = np.load(save_path, allow_pickle=False)
                 # X, Y, disr = dat["X"], dat["Y"], dat["disr"][()]
                 X = dat["X"]
             except BaseException:
@@ -152,18 +151,17 @@ class FeatureExtractor(object):
         return X, Y, disr
 
     def get_X(self, shot):
-
         use_signals = self.loader.conf['paths']['use_signals']
         sig_sample = shot.signals_dict[use_signals[0]]
         if len(shot.ttd.shape) == 1:
             shot.ttd = np.expand_dims(shot.ttd, axis=1)
         length = sig_sample.shape[0]
         if length < self.timesteps:
-            print(ttd, shot, shot.number)
+            print(shot.ttd, shot.number)
             print("Shot must be at least as long as the RNN length.")
             exit(1)
-        assert(len(sig_sample.shape) == len(shot.ttd.shape) == 2)
-        assert(shot.ttd.shape[1] == 1)
+        assert len(sig_sample.shape) == len(shot.ttd.shape) == 2
+        assert shot.ttd.shape[1] == 1
 
         X = []
         while(len(X) == 0):
@@ -180,13 +178,8 @@ class FeatureExtractor(object):
         offset = self.timesteps - 1
         return np.round(shot.ttd[offset:, 0]).astype(np.int)
 
-    def load_shot(
-            self,
-            shot,
-            is_inference=False,
-            sample_prob_d=1.0,
-            sample_prob_nd=1.0):
-
+    def load_shot(self, shot, is_inference=False, sample_prob_d=1.0,
+                  sample_prob_nd=1.0):
         X, Y, disr = self.process(shot)
 
         # cut shot ends if we are supposed to
@@ -199,10 +192,9 @@ class FeatureExtractor(object):
         if disr:
             sample_prob = sample_prob_d
         if sample_prob < 1.0:
-            indices = np.sort(
-                np.random.choice(np.array(range(len(Y))),
-                                 int(round(sample_prob*len(Y))),
-                                 replace=False))
+            indices = np.sort(np.random.choice(np.array(range(len(Y))),
+                                               int(round(sample_prob*len(Y))),
+                                               replace=False))
             X = X[indices]
             Y = Y[indices]
         return X, Y, disr
@@ -330,16 +322,16 @@ def build_callbacks(conf):
     return cbks.CallbackList(callbacks)
 
 
-def train(conf, shot_list_train, shot_list_validate, loader):
-
+def train(conf, shot_list_train, shot_list_validate, loader,
+          shot_list_test=None):
     np.random.seed(1)
-
-    print('validate: {} shots, {} disruptive'.format(
-        len(shot_list_validate),
-        shot_list_validate.num_disruptive()))
+    print_shot_list_sizes(shot_list_train, shot_list_validate)
     print('training: {} shots, {} disruptive'.format(
         len(shot_list_train),
         shot_list_train.num_disruptive()))
+    print('validate: {} shots, {} disruptive'.format(
+        len(shot_list_validate),
+        shot_list_validate.num_disruptive()))
 
     num_samples = conf['model']['shallow_model']['num_samples']
     feature_extractor = FeatureExtractor(loader)
@@ -426,6 +418,18 @@ def train(conf, shot_list_train, shot_list_validate, loader):
     Y_predv = model.predict(Xv)
     print("Validate")
     print(classification_report(Yv, Y_predv))
+    if ('monitor_test' in conf['callbacks'].keys()
+            and conf['callbacks']['monitor_test']):
+        times = conf['callbacks']['monitor_times']
+        roc_areas, losses = make_predictions_and_evaluate_multiple_times(
+            conf, shot_list_validate, loader, times)
+        for roc, t in zip(roc_areas, times):
+            print('val_roc_{} = {}'.format(t, roc))
+        if shot_list_test is not None:
+            roc_areas, losses = make_predictions_and_evaluate_multiple_times(
+                conf, shot_list_test, loader, times)
+            for roc, t in zip(roc_areas, times):
+                print('test_roc_{} = {}'.format(t, roc))
     # print(confusion_matrix(Y,Y_pred))
     _, _, _, roc_area, loss = make_predictions_and_evaluate_gpu(
         conf, shot_list_validate, loader)
@@ -497,3 +501,26 @@ def make_predictions_and_evaluate_gpu(
     roc_area = analyzer.get_roc_area(y_prime, y_gold, disruptive)
     loss = get_loss_from_list(y_prime, y_gold, conf['data']['target'])
     return y_prime, y_gold, disruptive, roc_area, loss
+
+
+def make_predictions_and_evaluate_multiple_times(conf, shot_list, loader,
+                                                 times, custom_path=None):
+    y_prime, y_gold, disruptive = make_predictions(conf, shot_list, loader,
+                                                   custom_path)
+    areas = []
+    losses = []
+    for T_min_curr in times:
+        # if 'monitor_test' in conf['callbacks'].keys() and
+        # conf['callbacks']['monitor_test']:
+        conf_curr = deepcopy(conf)
+        T_min_warn_orig = conf['data']['T_min_warn']
+        conf_curr['data']['T_min_warn'] = T_min_curr
+        assert conf['data']['T_min_warn'] == T_min_warn_orig
+        analyzer = PerformanceAnalyzer(conf=conf_curr)
+        roc_area = analyzer.get_roc_area(y_prime, y_gold, disruptive)
+        # shot_list.set_weights(analyzer.get_shot_difficulty(y_prime, y_gold,
+        # disruptive))
+        loss = get_loss_from_list(y_prime, y_gold, conf['data']['target'])
+        areas.append(roc_area)
+        losses.append(loss)
+    return areas, losses

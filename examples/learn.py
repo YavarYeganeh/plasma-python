@@ -30,12 +30,18 @@ matplotlib.use('Agg')
 
 pprint(conf)
 
-if conf['model']['shallow']:
+if 'torch' in conf['model'].keys() and conf['model']['torch']:
+    from plasma.models.torch_runner import (
+        train, make_predictions_and_evaluate_gpu
+        )
+elif conf['model']['shallow']:
     from plasma.models.shallow_runner import (
         train, make_predictions_and_evaluate_gpu
         )
 else:
-    from plasma.models.runner import train, make_predictions_and_evaluate_gpu
+    print('unknown driver. exiting')
+    exit(1)
+    # from plasma.models.runner import train, make_predictions_and_evaluate_gpu
 
 if conf['data']['normalizer'] == 'minmax':
     from plasma.preprocessor.normalize import MinMaxNormalizer as Normalizer
@@ -99,7 +105,7 @@ print('Training on {} shots, testing on {} shots'.format(
 if not only_predict:
     p = old_mp.Process(target=train,
                        args=(conf, shot_list_train,
-                             shot_list_validate, loader)
+                             shot_list_validate, loader, shot_list_test)
                        )
     p.start()
     p.join()

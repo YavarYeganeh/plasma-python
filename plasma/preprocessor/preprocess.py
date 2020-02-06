@@ -1,6 +1,6 @@
 '''
 #########################################################
-This file containts classes to handle data processing
+This file contains classes to handle data processing
 
 Author: Julian Kates-Harbeck, jkatesharbeck@g.harvard.edu
 
@@ -9,6 +9,7 @@ This work was supported by the DOE CSGF program.
 '''
 
 from __future__ import print_function
+import plasma.global_vars as g
 from os import listdir  # , remove
 import time
 import sys
@@ -18,24 +19,20 @@ import numpy as np
 import pathos.multiprocessing as mp
 
 from plasma.utils.processing import append_to_filename
+from plasma.utils.diagnostics import print_shot_list_sizes
 from plasma.primitives.shots import ShotList
 from plasma.utils.downloading import mkdirdepth
 
 
 class Preprocessor(object):
-
     def __init__(self, conf):
         self.conf = conf
 
     def clean_shot_lists(self):
         shot_list_dir = self.conf['paths']['shot_list_dir']
-        paths = [
-            os.path.join(
-                shot_list_dir,
-                f) for f in listdir(shot_list_dir) if os.path.isfile(
-                os.path.join(
-                    shot_list_dir,
-                    f))]
+        paths = [os.path.join(shot_list_dir, f) for f in
+                 listdir(shot_list_dir) if
+                 os.path.isfile(os.path.join(shot_list_dir, f))]
         for path in paths:
             self.clean_shot_list(path)
 
@@ -87,16 +84,15 @@ class Preprocessor(object):
         # empty
         used_shots = ShotList()
 
-        use_cores = max(1, mp.cpu_count()-2)
+        # TODO(KGF): generalize the follwowing line to perform well on
+        # architecutres other than CPUs, e.g. KNLs
+        # min( <desired-maximum-process-count>, max(1,mp.cpu_count()-2) )
+        use_cores = max(1, mp.cpu_count() - 2)
         pool = mp.Pool(use_cores)
-        print('running in parallel on {} processes'.format(pool._processes))
+        print('Running in parallel on {} processes'.format(pool._processes))
         start_time = time.time()
-        for (
-            i,
-            shot) in enumerate(
-            pool.imap_unordered(
-                self.preprocess_single_file,
-                shot_list_picked)):
+        for (i, shot) in enumerate(pool.imap_unordered(
+                self.preprocess_single_file, shot_list_picked)):
             # for (i,shot) in
             # enumerate(map(self.preprocess_single_file,shot_list_picked)):
             sys.stdout.write('\r{}/{}'.format(i, len(shot_list_picked)))
@@ -104,20 +100,22 @@ class Preprocessor(object):
 
         pool.close()
         pool.join()
-        print('Finished Preprocessing {} files in {} seconds'.format(
-            len(shot_list_picked), time.time()-start_time))
+        print('\nFinished preprocessing {} files in {} seconds'.format(
+            len(shot_list_picked), time.time() - start_time))
+        print('Using {} shots ({} disruptive shots)'.format(
+            len(used_shots), used_shots.num_disruptive()))
+        print('Omitted {} shots of {} total shots'.format(
+            len(shot_list_picked) - len(used_shots), len(shot_list_picked)))
         print(
-            'Omitted {} shots of {} total.'.format(
-                len(shot_list_picked)
-                - len(used_shots),
-                len(shot_list_picked)))
-        print('{}/{} disruptive shots'.format(used_shots.num_disruptive(),
-                                              len(used_shots)))
+            'Omitted {} disruptive shots of {} total disruptive shots'.format(
+                shot_list_picked.num_disruptive()
+                - used_shots.num_disruptive(),
+                shot_list_picked.num_disruptive()))
+
         if len(used_shots) == 0:
-            print(
-                "WARNING: All shots were omitted, please ensure raw data "
-                " is complete and available at {}.".format(
-                    self.conf['paths']['signal_prepath']))
+            print("WARNING: All shots were omitted, please ensure raw data "
+                  " is complete and available at {}.".format(
+                      self.conf['paths']['signal_prepath']))
         return used_shots
 
     def preprocess_single_file(self, shot):
@@ -127,7 +125,6 @@ class Preprocessor(object):
         if recompute or not shot.previously_saved(processed_prepath):
             shot.preprocess(self.conf)
             shot.save(processed_prepath)
-
         else:
             try:
                 shot.restore(processed_prepath, light=True)
@@ -135,13 +132,13 @@ class Preprocessor(object):
             except BaseException:
                 shot.preprocess(self.conf)
                 shot.save(processed_prepath)
-                sys.stdout.write(
-                    '\r{} exists but corrupted, resaved.'.format(
-                        shot.number))
+                sys.stdout.write('\r{} exists but corrupted, resaved.'.format(
+                    shot.number))
         shot.make_light()
         return shot
 
     def get_individual_channel_dirs(self):
+        # TODO(KGF): unused
         return self.conf['paths']['signals_dirs']
 
     def get_shot_list_path(self):
@@ -149,7 +146,7 @@ class Preprocessor(object):
 
     def load_shotlists(self):
         path = self.get_shot_list_path()
-        data = np.load(path, encoding="latin1")
+        data = np.load(path, encoding="latin1", allow_pickle=True)
         shot_list_train = data['shot_list_train'][()]
         shot_list_validate = data['shot_list_validate'][()]
         shot_list_test = data['shot_list_test'][()]
@@ -159,18 +156,13 @@ class Preprocessor(object):
             return ShotList(shot_list_train), ShotList(
                 shot_list_validate), ShotList(shot_list_test)
 
-    def save_shotlists(
-            self,
-            shot_list_train,
-            shot_list_validate,
-            shot_list_test):
+    def save_shotlists(self, shot_list_train, shot_list_validate,
+                       shot_list_test):
         path = self.get_shot_list_path()
         mkdirdepth(path)
-        np.savez(
-            path,
-            shot_list_train=shot_list_train,
-            shot_list_validate=shot_list_validate,
-            shot_list_test=shot_list_test)
+        np.savez(path, shot_list_train=shot_list_train,
+                 shot_list_validate=shot_list_validate,
+                 shot_list_test=shot_list_test)
 
 
 def apply_bleed_in(conf, shot_list_train, shot_list_validate, shot_list_test):
@@ -201,7 +193,7 @@ def apply_bleed_in(conf, shot_list_train, shot_list_validate, shot_list_test):
             num_sampled_nd+num_sampled_d, num_sampled_d, num_sampled_nd))
         print("Before adding: training shots: {} validation shots: {}".format(
             len(shot_list_train), len(shot_list_validate)))
-        assert(num_sampled_d == num)
+        assert num_sampled_d == num
         # add bleed-in shots to training and validation set repeatedly
         if conf['data']['bleed_in_equalize_sets']:
             print("Applying equalized bleed in")
@@ -233,7 +225,7 @@ def apply_bleed_in(conf, shot_list_train, shot_list_validate, shot_list_test):
         #         if conf['data']['bleed_in_remove_from_test']:
         #             shot_list_test.remove(s)
         # else:
-        #     print('No disruptive shots in test set, omitting bleed in')
+        #     print('No disruptive shots in test set, [omit] bleed in')
         # if num_nd > 0:
         #     for i in range(num):
         #         s = shot_list_test.sample_single_class(False)
@@ -242,40 +234,40 @@ def apply_bleed_in(conf, shot_list_train, shot_list_validate, shot_list_test):
         #         if conf['data']['bleed_in_remove_from_test']:
         #             shot_list_test.remove(s)
         # else:
-        #     print('No nondisruptive shots in test set, omitting bleed in')
+        #     print('No nondisruptive shots in test set, [omit] bleed in')
     return shot_list_train, shot_list_validate, shot_list_test
 
 
-def guarantee_preprocessed(conf):
+def guarantee_preprocessed(conf, verbose=False):
     pp = Preprocessor(conf)
     if pp.all_are_preprocessed():
-        print("shots already processed.")
+        if verbose:
+            g.print_unique("shots already processed.")
         (shot_list_train, shot_list_validate,
          shot_list_test) = pp.load_shotlists()
     else:
-        print("preprocessing all shots", end='')
+        if verbose:
+            g.print_unique("preprocessing all shots...")  # , end='')
         pp.clean_shot_lists()
-        shot_list = sorted(pp.preprocess_all())
+        shot_list = pp.preprocess_all()
+        shot_list.sort()
         shot_list_train, shot_list_test = shot_list.split_train_test(conf)
         # num_shots = len(shot_list_train) + len(shot_list_test)
         validation_frac = conf['training']['validation_frac']
         if validation_frac <= 0.05:
-            print('Setting validation to a minimum of 0.05')
+            if verbose:
+                g.print_unique('Setting validation to a minimum of 0.05')
             validation_frac = 0.05
         shot_list_train, shot_list_validate = shot_list_train.split_direct(
             1.0-validation_frac, do_shuffle=True)
         pp.save_shotlists(shot_list_train, shot_list_validate, shot_list_test)
     shot_list_train, shot_list_validate, shot_list_test = apply_bleed_in(
         conf, shot_list_train, shot_list_validate, shot_list_test)
-    print(
-        'validate: {} shots, {} disruptive'.format(
-            len(shot_list_validate),
-            shot_list_validate.num_disruptive()))
-    print(
-        'training: {} shots, {} disruptive'.format(
-            len(shot_list_train),
-            shot_list_train.num_disruptive()))
-    print('testing: {} shots, {} disruptive'.format(
-        len(shot_list_test), shot_list_test.num_disruptive()))
-    print("...done")
+    if verbose:
+        print_shot_list_sizes(shot_list_train, shot_list_validate,
+                              shot_list_test)
+        g.print_unique("...done")
+    #    g.print_unique("...printing test shot list:")
+    #    for s in shot_list_test:
+    #       g.print_unique(str(s.number))
     return shot_list_train, shot_list_validate, shot_list_test
